@@ -1,64 +1,51 @@
+// server.js (фрагмент)
 import express from 'express';
+import bodyParser from 'body-parser';
 import crypto from 'crypto';
 import admin from 'firebase-admin';
 
-const serviceJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (!serviceJson) {
-  console.error('Missing FIREBASE_SERVICE_ACCOUNT_JSON');
-  process.exit(1);
-}
-const serviceAccount = JSON.parse(serviceJson);
-
-if (!admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-}
-
-function checkTelegramAuth(data, botToken) {
-  const { hash, ...rest } = data;
-  const secret = crypto.createHash('sha256').update(botToken).digest();
-  const checkString = Object.keys(rest).sort().map(k => `${k}=${rest[k]}`).join('\n');
-  const hmac = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
-  return hmac === hash;
-}
-
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
+
+// ... admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 app.post('/auth/telegram/verify', async (req, res) => {
   try {
-    const p = req.body;
-    if (!p?.id || !p?.hash) return res.status(400).json({ error: 'bad_payload' });
+    const { redirect, state, phone } = req.query; // из tg-login.html
+    const data = req.body; // payload от Telegram
 
-    const botToken = process.env.BOT_TOKEN;
-    if (!botToken) return res.status(500).json({ error: 'no_bot_token' });
+    // 1) верификация Telegram-подписи
+    const botToken = process.env.TG_BOT_TOKEN;
+    const secret = crypto.createHash('sha256').update(botToken).digest();
+    const check = Object.keys(data)
+      .filter(k => k !== 'hash')
+      .sort()
+      .map(k => `${k}=${data[k]}`)
+      .join('\n');
+    const hmac = crypto.createHmac('sha256', secret).update(check).digest('hex');
+    if (hmac !== String(data.hash)) {
+      return res.status(401).json({ error: 'Bad signature' });
+    }
 
-    if (!checkTelegramAuth(p, botToken)) return res.status(401).json({ error: 'bad_signature' });
-
-    const now = Math.floor(Date.now()/1000);
-    if (Math.abs(now - Number(p.auth_date)) > 300) return res.status(401).json({ error: 'expired' });
-
-    const uid = `telegram:${p.id}`;
+    // 2) генерим Firebase custom token
+    const uid = `tg_${data.id}`; // ваш mapping
     const customToken = await admin.auth().createCustomToken(uid, {
-      provider: 'telegram',
-      telegramId: String(p.id),
+      tg_id: String(data.id),
+      tg_username: data.username || null,
+      tg_name: data.first_name || '',
     });
 
-    return res.json({
-      customToken,
-      telegramProfile: {
-        telegramId: String(p.id),
-        firstName: p.first_name || null,
-        lastName:  p.last_name  || null,
-        fullName:  [p.first_name, p.last_name].filter(Boolean).join(' ') || null,
-        username:  p.username   || null,
-        photoURL:  p.photo_url  || null
-      }
-    });
+    // 3) если задан redirect (deeplink) — уходим туда
+    if (redirect) {
+      const url = `${redirect}?token=${encodeURIComponent(customToken)}${phone ? `&phone=${encodeURIComponent(phone)}` : ''}${state ? `&state=${encodeURIComponent(state)}` : ''}`;
+      return res.redirect(302, url);
+    }
+
+    // иначе JSON (старый режим)
+    res.json({ customToken });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'internal' });
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/', (_, res) => res.send('ok'));
 app.listen(process.env.PORT || 3000, () => console.log('up'));
