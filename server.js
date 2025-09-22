@@ -1,4 +1,4 @@
-// server.js — ESM, Node 18–22, Render OK
+// server.js — ESM, Node 18–22, Render OK, с диагностикой ENV
 import express from 'express';
 import crypto from 'crypto';
 import cors from 'cors';
@@ -12,18 +12,36 @@ const {
   // диплинк обратно в приложение (можно переопределить в ENV)
   APP_DEEPLINK = 'zerno://tg-auth',
 
-  // Вариант А: весь сервис-аккаунт JSON одной переменной
+  // Вариант A: весь сервис-аккаунт JSON одной переменной
   FIREBASE_SERVICE_ACCOUNT_JSON,
 
-  // Вариант Б: три отдельные переменные (fallback)
+  // Вариант B: три отдельные переменные
   FIREBASE_PROJECT_ID,
   FIREBASE_CLIENT_EMAIL,
   FIREBASE_PRIVATE_KEY,
+
+  // Вариант C: JSON в base64 (иногда удобнее)
+  FIREBASE_SERVICE_ACCOUNT_B64,
 } = process.env;
+
+// ─────────────────────────────────────────────────────────────
+// Помощники для маскировки секретов в логах
+function maskEmail(email = '') {
+  const [u, d] = String(email).split('@');
+  if (!d) return '***';
+  const user = u?.length > 2 ? `${u[0]}***${u[u.length - 1]}` : '***';
+  return `${user}@${d}`;
+}
+function maskKey(k = '') {
+  const s = String(k);
+  if (s.length < 16) return '***';
+  return `${s.slice(0, 10)}...${s.slice(-10)}`; // показываем только хвостики
+}
+// ─────────────────────────────────────────────────────────────
 
 /** Загружаем креды Firebase Admin из ENV */
 function loadFirebaseCredentials() {
-  // Приоритет — один JSON
+  // Приоритет — A: один JSON (строкой)
   if (FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
       const raw = FIREBASE_SERVICE_ACCOUNT_JSON.trim();
@@ -33,19 +51,40 @@ function loadFirebaseCredentials() {
         throw new Error('Missing fields in FIREBASE_SERVICE_ACCOUNT_JSON');
       }
       return {
+        method: 'JSON',
         projectId: json.project_id,
         clientEmail: json.client_email,
         privateKey: json.private_key,
       };
     } catch (e) {
-      console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
-      // пойдём по варианту Б
+      console.error('[creds] Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', e.message);
     }
   }
 
-  // Фоллбек — три переменные
+  // Вариант C: JSON в base64
+  if (FIREBASE_SERVICE_ACCOUNT_B64) {
+    try {
+      const decoded = Buffer.from(FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8');
+      const normalized = decoded.replace(/\\n/g, '\n');
+      const json = JSON.parse(normalized);
+      if (!json.project_id || !json.client_email || !json.private_key) {
+        throw new Error('Missing fields in FIREBASE_SERVICE_ACCOUNT_B64');
+      }
+      return {
+        method: 'B64',
+        projectId: json.project_id,
+        clientEmail: json.client_email,
+        privateKey: json.private_key,
+      };
+    } catch (e) {
+      console.error('[creds] Invalid FIREBASE_SERVICE_ACCOUNT_B64:', e.message);
+    }
+  }
+
+  // Фоллбек — B: три переменные
   if (FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY) {
     return {
+      method: 'TRIPLE',
       projectId: FIREBASE_PROJECT_ID,
       clientEmail: FIREBASE_CLIENT_EMAIL,
       privateKey: FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
@@ -57,18 +96,34 @@ function loadFirebaseCredentials() {
 
 const creds = loadFirebaseCredentials();
 
+// Диагностика: что увидели из ENV (без секретов)
+console.log('[env] TG_BOT_TOKEN:', TG_BOT_TOKEN ? 'SET' : 'MISSING');
+if (creds) {
+  console.log('[env] Firebase creds method:', creds.method);
+  console.log('[env] projectId:', creds.projectId || 'MISSING');
+  console.log('[env] clientEmail:', creds.clientEmail ? maskEmail(creds.clientEmail) : 'MISSING');
+  console.log('[env] privateKey:', creds.privateKey ? maskKey(creds.privateKey) : 'MISSING');
+} else {
+  console.error('[env] Firebase creds: NOT FOUND (JSON/B64/TRIPLE all missing or invalid)');
+}
+
 // Инициализация Firebase Admin (модульный API)
 if (!getApps().length) {
   if (!creds) {
     console.error('Firebase Admin credentials are missing in environment variables.');
   } else {
-    initializeApp({
-      credential: cert({
-        projectId: creds.projectId,
-        clientEmail: creds.clientEmail,
-        privateKey: creds.privateKey,
-      }),
-    });
+    try {
+      initializeApp({
+        credential: cert({
+          projectId: creds.projectId,
+          clientEmail: creds.clientEmail,
+          privateKey: creds.privateKey,
+        }),
+      });
+      console.log('[firebase-admin] initializeApp: OK');
+    } catch (e) {
+      console.error('[firebase-admin] initializeApp: FAILED:', e.message);
+    }
   }
 }
 
@@ -76,6 +131,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+/** Диагностический эндпойнт */
+app.get('/_diag', async (_req, res) => {
+  const initialized = !!getApps().length;
+  res.json({
+    ok: true,
+    tgBotToken: !!TG_BOT_TOKEN,
+    firebaseAdminInitialized: initialized,
+    method: creds?.method || null,
+    projectId: creds?.projectId || null,
+    clientEmailMasked: creds?.clientEmail ? maskEmail(creds.clientEmail) : null,
+    privateKeyMasked: creds?.privateKey ? maskKey(creds.privateKey) : null,
+  });
+});
 
 /** Проверка подписи Telegram Login Widget */
 function verifyTelegramAuth(queryObj) {
@@ -96,8 +165,6 @@ function redirectToCallback(req, res) {
   const target = '/tg/callback' + (qs ? `?${qs}` : '');
   return res.redirect(302, target);
 }
-
-// Часто встречающиеся старые роуты (на случай, если где-то остались ссылки)
 app.get('/auth/telegram/verify', redirectToCallback);
 app.get('/auth/telegram/callback', redirectToCallback);
 app.get('/tg/verify', redirectToCallback);
@@ -106,7 +173,11 @@ app.get('/tg/verify', redirectToCallback);
 app.get('/tg/callback', async (req, res) => {
   try {
     if (!TG_BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
-    if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
+
+    if (!getApps().length) {
+      return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
+    }
+
     if (!verifyTelegramAuth(req.query)) return res.status(403).send('Invalid Telegram hash');
 
     const {
