@@ -90,11 +90,23 @@ app.get('/_diag', (_req, res) => {
   });
 });
 
+app.get('/whoami', async (_req, res) => {
+  try {
+    if (!BOT_TOKEN) return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN not set' });
+    const r = await fetch(`https://api.telegram.org/bot${encodeURIComponent(BOT_TOKEN)}/getMe`);
+    const j = await r.json();
+    res.json({ ok: true, botFromEnv: j?.result?.username || null, raw: j });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 // Для ручной проверки подписи: /_debug-sig?<параметры от TG>
 const TL_ALLOWED_KEYS = new Set([
   'id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'allow_write_to_pm',
 ]);
-const tokenSecret = () => crypto.createHash('sha256').update(TG_BOT_TOKEN || '').digest();
+const BOT_TOKEN = (TG_BOT_TOKEN || '').trim();
+const tokenSecret = () => crypto.createHash('sha256').update(BOT_TOKEN).digest();
 
 function buildDataCheckString(queryObj) {
   const data = {};
