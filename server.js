@@ -6,10 +6,10 @@ import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 
 const {
-  // Telegram
+  // Telegram bot token (обязателен)
   TG_BOT_TOKEN,
 
-  // диплинк обратно в приложение
+  // диплинк обратно в приложение (можно переопределить в ENV)
   APP_DEEPLINK = 'zerno://tg-auth',
 
   // Вариант А: весь сервис-аккаунт JSON одной переменной
@@ -90,6 +90,18 @@ function verifyTelegramAuth(queryObj) {
   return hmac === hash;
 }
 
+// --- Алиасы старых путей → на новый обработчик /tg/callback ---
+function redirectToCallback(req, res) {
+  const qs = new URLSearchParams(req.query || {}).toString();
+  const target = '/tg/callback' + (qs ? `?${qs}` : '');
+  return res.redirect(302, target);
+}
+
+// Часто встречающиеся старые роуты (на случай, если где-то остались ссылки)
+app.get('/auth/telegram/verify', redirectToCallback);
+app.get('/auth/telegram/callback', redirectToCallback);
+app.get('/tg/verify', redirectToCallback);
+
 /** Основной callback: браузер → Render → диплинк в приложение */
 app.get('/tg/callback', async (req, res) => {
   try {
@@ -102,15 +114,14 @@ app.get('/tg/callback', async (req, res) => {
       first_name,
       last_name,
       username,
-      photo_url,   // не используем, но можно проставить в claims при желании
-      auth_date,   // не используем
-      phone = '',  // опционально прокидываем со страницы хостинга
+      // photo_url, auth_date — не используем
+      phone = '', // можно прокидывать со страницы хостинга как ?phone=998XXXXXXXXX (без '+')
     } = req.query;
 
     const uid = `tg_${id}`;
     const name = [first_name, last_name].filter(Boolean).join(' ');
 
-    // Кастомные клеймы — аккуратно, не перебарщиваем размером
+    // Кастомные клеймы — не делай их слишком большими
     const claims = {
       tgId: String(id),
       username: username || '',
