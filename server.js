@@ -1,157 +1,123 @@
 // server.js
+import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import crypto from 'crypto';
 import admin from 'firebase-admin';
-import cors from 'cors';
 
-// ---------------- Firebase Admin init ----------------
-function loadServiceAccount() {
-  const jsonRaw =
+// ---------- Firebase Admin init ----------
+function initAdmin() {
+  if (admin.apps.length) return;
+
+  const jsonFromEnv =
     process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON ||
-    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
-    (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
-      ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8')
-      : null);
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
-  if (!jsonRaw) return null;
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
+  let creds = null;
   try {
-    return JSON.parse(jsonRaw);
+    if (jsonFromEnv) creds = JSON.parse(jsonFromEnv);
+    else if (b64) creds = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
   } catch (e) {
-    console.error('Failed to parse service account JSON from env:', e.message);
-    return null;
+    console.error('Failed to parse service account JSON:', e.message);
   }
+
+  if (!creds) {
+    throw new Error(
+      'No Firebase service account found. Provide GOOGLE_APPLICATION_CREDENTIALS_JSON or FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_BASE4'
+    );
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert(creds),
+  });
+  console.log('Firebase Admin initialized');
 }
 
-const svc = loadServiceAccount();
-if (admin.apps.length === 0) {
-  if (svc) {
-    admin.initializeApp({
-      credential: admin.credential.cert(svc),
-      // databaseURL можно добавить при необходимости:
-      // databaseURL: process.env.FIREBASE_DATABASE_URL
-    });
-    console.log('[firebase] initialized with service account JSON');
-  } else {
-    // Попытка через Application Default Credentials (если настроено)
-    admin.initializeApp();
-    console.log('[firebase] initialized with application default credentials');
-  }
-}
+initAdmin();
 
-// ---------------- App & middlewares ----------------
+// ---------- App ----------
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// health
+app.use(
+  cors({
+    origin: (_origin, cb) => cb(null, true), // можно ужесточить
+  })
+);
+app.use(express.json({ limit: '1mb' }));
+
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-// ---------------- Helpers ----------------
-function verifyTelegramLogin(data, botToken) {
+function verifyTelegramPayload(payload, botToken) {
   if (!botToken) throw new Error('TG_BOT_TOKEN is not set');
 
-  // Срок годности (опционально): 1 сутки
-  if (data.auth_date && Math.abs(Date.now() / 1000 - Number(data.auth_date)) > 86400) {
-    throw new Error('Telegram auth data expired');
-  }
-
   const secret = crypto.createHash('sha256').update(botToken).digest();
-  const check = Object.keys(data)
-    .filter((k) => k !== 'hash' && data[k] !== undefined && data[k] !== null)
+  const check = Object.keys(payload)
+    .filter((k) => k !== 'hash' && payload[k] !== undefined && payload[k] !== null)
     .sort()
-    .map((k) => `${k}=${data[k]}`)
+    .map((k) => `${k}=${payload[k]}`)
     .join('\n');
 
   const hmac = crypto.createHmac('sha256', secret).update(check).digest('hex');
-  if (hmac !== String(data.hash)) {
-    throw new Error('Bad signature');
-  }
+  return hmac === String(payload.hash);
 }
 
-function sanitizeRedirect(url) {
-  if (!url) return null;
+async function handleVerify(req, res) {
   try {
-    const u = new URL(url);
-    // Разрешаем только http(s) и вашу кастомную схему zerno://
-    if (u.protocol === 'http:' || u.protocol === 'https:') return u.toString();
-    if (u.protocol === 'zerno:') return `zerno://${u.host}${u.pathname}${u.search}`;
-  } catch (_) {
-    // может быть прямая строка вида "zerno://tg-auth"
-    if (url.startsWith('zerno://')) return url;
-  }
-  return null;
-}
+    const method = req.method;
+    const src = method === 'GET' ? req.query : req.body;
 
-function makeQuery(params = {}) {
-  const q = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && String(v).length) q.append(k, String(v));
-  });
-  return q.toString();
-}
+    const redirect = src.redirect; // zerno://tg-auth
+    const state = src.state;
+    const phone = src.phone;
 
-// ---------------- Main endpoint ----------------
-app.all('/auth/telegram/verify', async (req, res) => {
-  try {
-    const carrier = req.method === 'GET' ? req.query : (req.body || {});
-    const redirectRaw = carrier.redirect;
-    const state = carrier.state;
-    const phone = carrier.phone;
+    const data = {
+      id: src.id,
+      first_name: src.first_name,
+      last_name: src.last_name,
+      username: src.username,
+      photo_url: src.photo_url,
+      auth_date: src.auth_date,
+      hash: src.hash,
+    };
 
-    // Забираем только поля Telegram для проверки подписи
-    const tg = {};
-    ['id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'hash'].forEach((k) => {
-      if (carrier[k] != null) tg[k] = carrier[k];
+    if (!data.id || !data.hash || !data.auth_date) {
+      return res.status(400).json({ error: 'Bad data' });
+    }
+
+    const ok = verifyTelegramPayload(data, process.env.TG_BOT_TOKEN);
+    if (!ok) return res.status(401).json({ error: 'Bad signature' });
+
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - Number(data.auth_date)) > 300) {
+      return res.status(401).json({ error: 'Auth data expired' });
+    }
+
+    const uid = `tg_${data.id}`;
+    const customToken = await admin.auth().createCustomToken(uid, {
+      tg_id: String(data.id),
+      tg_username: data.username || null,
+      tg_name: [data.first_name, data.last_name].filter(Boolean).join(' ') || null,
     });
 
-    // Валидация и подпись
-    if (!tg.id || !tg.hash || !tg.auth_date) {
-      return res.status(400).send('Missing Telegram fields');
-    }
-    verifyTelegramLogin(tg, process.env.TG_BOT_TOKEN);
-
-    // Генерация кастомного токена Firebase
-    const uid = `tg_${tg.id}`;
-    const claims = {
-      tg_id: String(tg.id),
-      tg_username: tg.username || null,
-      tg_name: [tg.first_name || '', tg.last_name || ''].join(' ').trim() || null,
-    };
-    const customToken = await admin.auth().createCustomToken(uid, claims);
-
-    // Если есть redirect (deeplink) — делаем 302
-    const redirect = sanitizeRedirect(redirectRaw);
-    if (redirect) {
-      const q = makeQuery({
-        token: customToken,
-        phone,
-        state,
-      });
-      const target = `${redirect}${redirect.includes('?') ? '&' : '?'}${q}`;
-
-      // 302 + HTML фоллбек (на случай странных браузеров)
-      res.status(302)
-        .set('Location', target)
-        .type('text/html')
-        .send(
-          `<!doctype html><meta http-equiv="refresh" content="0;url='${target}'"/><a href="${target}">Continue</a>`
-        );
-      return;
+    if (method === 'GET' && redirect) {
+      const q = new URLSearchParams({ token: customToken });
+      if (phone) q.set('phone', phone);
+      if (state) q.set('state', state);
+      const url = `${redirect}?${q.toString()}`;
+      return res.redirect(302, url);
     }
 
-    // Fallback — просто вернуть JSON
-    res.json({ customToken });
+    return res.json({ customToken });
   } catch (e) {
-    console.error('[verify] error:', e);
-    res.status(400).send(typeof e?.message === 'string' ? e.message : 'Bad request');
+    console.error('verify error:', e);
+    return res.status(500).json({ error: e.message });
   }
-});
+}
 
-// Root
-app.get('/', (_req, res) => res.type('text/plain').send('Telegram verifier up'));
+app.get('/auth/telegram/verify', handleVerify);
+app.post('/auth/telegram/verify', handleVerify);
 
-// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server listening on', PORT));
+app.listen(PORT, () => console.log(`up on :${PORT}`));
