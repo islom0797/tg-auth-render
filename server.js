@@ -1,12 +1,10 @@
 // server.js — Telegram Login → Firebase Custom Token + умный upsert профиля по номеру
-// + обновление фото из Telegram и удаление старой фотки из Firebase Storage (если она там)
 import express from 'express';
 import crypto from 'crypto';
 import cors from 'cors';
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
-import { getStorage } from 'firebase-admin/storage'; // ⬅️
 
 const {
   TG_BOT_TOKEN,
@@ -17,9 +15,6 @@ const {
   FIREBASE_PROJECT_ID,
   FIREBASE_CLIENT_EMAIL,
   FIREBASE_PRIVATE_KEY,
-
-  // если хочешь явно задать бакет (иначе возьмём <projectId>.appspot.com)
-  FIREBASE_STORAGE_BUCKET,
 
   DEBUG_ALLOW_BYPASS = '0',
 } = process.env;
@@ -69,19 +64,10 @@ if (creds) {
 console.log('[env] DEBUG_ALLOW_BYPASS:', DEBUG_ALLOW_BYPASS);
 
 /* ───────── init firebase-admin ───────── */
-let defaultBucketName = FIREBASE_STORAGE_BUCKET || (creds?.projectId ? `${creds.projectId}.appspot.com` : undefined);
-
 if (!getApps().length && creds) {
   try {
-    initializeApp({
-      credential: cert({
-        projectId: creds.projectId,
-        clientEmail: creds.clientEmail,
-        privateKey: creds.privateKey,
-      }),
-      storageBucket: defaultBucketName, // ⬅️ можно и без этого, но пусть будет
-    });
-    console.log('[firebase-admin] initializeApp: OK; bucket =', defaultBucketName || '(default)');
+    initializeApp({ credential: cert({ projectId: creds.projectId, clientEmail: creds.clientEmail, privateKey: creds.privateKey }) });
+    console.log('[firebase-admin] initializeApp: OK');
   } catch (e) { console.error('[firebase-admin] initializeApp FAILED:', e.message); }
 }
 
@@ -101,7 +87,6 @@ app.get('/_diag', (_req, res) => {
     projectId: creds?.projectId || null,
     clientEmailMasked: creds?.clientEmail ? maskEmail(creds.clientEmail) : null,
     privateKeyMasked: creds?.privateKey ? maskKey(creds.privateKey) : null,
-    storageBucket: defaultBucketName || null,
     DEBUG_ALLOW_BYPASS: DEBUG_ALLOW_BYPASS === '1',
   });
 });
@@ -164,47 +149,6 @@ function verifyTelegramAuth(q) {
   return { ok:true };
 }
 
-/* ───────── helpers: удаление старой фотки из Storage ───────── */
-function parseGsFileFromUrl(url = '', bucketName) {
-  // поддержим два варианта ссылок: gs://bucket/path и https://firebasestorage.googleapis.com/...
-  if (!url) return null;
-  try {
-    if (url.startsWith('gs://')) {
-      const u = new URL(url);
-      if (bucketName && u.host !== bucketName) return null;
-      return u.pathname.replace(/^\/+/, ''); // path/to/file.jpg
-    }
-    if (url.includes('firebasestorage.googleapis.com')) {
-      const u = new URL(url);
-      // формат: /v0/b/<bucket>/o/<path_encoded>?...
-      const parts = u.pathname.split('/').filter(Boolean);
-      const iB = parts.indexOf('b');
-      const iO = parts.indexOf('o');
-      if (iB >= 0 && iO >= 0 && parts[iB+1] && parts[iO+1]) {
-        const b = parts[iB+1];
-        if (bucketName && b !== bucketName) return null;
-        return decodeURIComponent(parts[iO+1]); // path/to/file.jpg
-      }
-    }
-  } catch {}
-  return null;
-}
-
-async function deleteOldPhotoIfInStorage(oldUrl) {
-  try {
-    if (!oldUrl) return;
-    const bucketName = defaultBucketName || (creds?.projectId ? `${creds.projectId}.appspot.com` : null);
-    if (!bucketName) return;
-    const relPath = parseGsFileFromUrl(oldUrl, bucketName);
-    if (!relPath) return; // не наш бакет — ничего не удаляем
-    const bucket = getStorage().bucket(bucketName);
-    await bucket.file(relPath).delete({ ignoreNotFound: true });
-    console.log('[storage] deleted old photo:', relPath);
-  } catch (e) {
-    console.warn('[storage] delete old photo failed:', e?.message || e);
-  }
-}
-
 /* ───────── основной callback ───────── */
 app.get('/tg/callback', async (req, res) => {
   try {
@@ -229,7 +173,7 @@ app.get('/tg/callback', async (req, res) => {
     const phoneE164 = phone ? (phone.startsWith('+') ? phone : `+${phone}`) : '';
     if (!phoneE164) return res.status(400).send('Phone is required');
 
-    // 1) умный upsert профиля (обновляем фото, старую из Storage удаляем)
+    // 1) умный upsert профиля
     try {
       const db = getFirestore();
       const ref = db.doc(`users/${phoneE164}`);
@@ -238,22 +182,23 @@ app.get('/tg/callback', async (req, res) => {
 
       if (snap.exists) {
         const old = snap.data() || {};
-        // если в TG пришёл новый photo_url и он отличается от старого — удалим старый из Storage (если он там)
-        if (photo_url && old.photoURL && photo_url !== old.photoURL) {
-          await deleteOldPhotoIfInStorage(old.photoURL);
-        }
-
         const delta = {
-          // не затираем уже заполненные поля — кроме photoURL (её обновляем всегда при наличии новой)
+          // не трогаем существующие meaningful-поля
           firstName: old.firstName ?? (first_name || null),
           lastName : old.lastName  ?? (last_name  || null),
           fullName : old.fullName  ?? (name       || null),
           username : old.username  ?? (username   || null),
+          photoURL : old.photoURL  ?? (photo_url  || null),
 
-          photoURL : photo_url || old.photoURL || null, // ⬅️ обновляем
+          // провайдера не перезаписываем, если уже google/и т.д.
           provider : old.provider || 'telegram',
+
+          // отметки логина
           lastLoginAt: Date.now(),
+          // если createdAt не было — поставим
           createdAt: old.createdAt || Date.now(),
+
+          // полезно иметь связь с телеграмом
           telegramId: String(id),
         };
         await ref.set(delta, { merge: true });
@@ -264,7 +209,7 @@ app.get('/tg/callback', async (req, res) => {
           lastName: last_name || null,
           fullName: name || null,
           username: username || null,
-          photoURL: photo_url || null, // новая фотка
+          photoURL: photo_url || null,
           email: null,
           provider: 'telegram',
           googleId: null,
