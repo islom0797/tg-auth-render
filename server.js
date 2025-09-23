@@ -1,4 +1,4 @@
-// server.js — ESM, Node 18–22 (Render OK) с диагностикой подписи
+// server.js — ESM, Node 18–22 (Render OK) с корректной верификацией Telegram
 import express from 'express';
 import crypto from 'crypto';
 import cors from 'cors';
@@ -9,17 +9,18 @@ const {
   TG_BOT_TOKEN,
   APP_DEEPLINK = 'zerno://tg-auth',
 
+  // Firebase creds (любой из вариантов)
   FIREBASE_SERVICE_ACCOUNT_JSON,
+  FIREBASE_SERVICE_ACCOUNT_B64,
   FIREBASE_PROJECT_ID,
   FIREBASE_CLIENT_EMAIL,
   FIREBASE_PRIVATE_KEY,
-  FIREBASE_SERVICE_ACCOUNT_B64,
 
-  // включи "1", чтобы протестировать поток без verify (временно!)
+  // Временный флаг для теста без verify (используй только локально!)
   DEBUG_ALLOW_BYPASS = '0',
 } = process.env;
 
-// ── helpers: маски для логов ─────────────────────────────────
+/* ───────── helpers: маски для логов ───────── */
 const maskEmail = (email = '') => {
   const [u, d] = String(email).split('@');
   if (!d) return '***';
@@ -28,7 +29,7 @@ const maskEmail = (email = '') => {
 };
 const maskKey = (s = '') => (String(s).length < 16 ? '***' : `${s.slice(0, 10)}...${s.slice(-10)}`);
 
-// ── creds loader ─────────────────────────────────────────────
+/* ───────── загрузка Firebase creds ───────── */
 function loadFirebaseCredentials() {
   if (FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
@@ -63,7 +64,7 @@ if (creds) {
 }
 console.log('[env] DEBUG_ALLOW_BYPASS:', DEBUG_ALLOW_BYPASS);
 
-// init firebase-admin
+/* ───────── init firebase-admin ───────── */
 if (!getApps().length && creds) {
   try {
     initializeApp({ credential: cert({ projectId: creds.projectId, clientEmail: creds.clientEmail, privateKey: creds.privateKey }) });
@@ -71,12 +72,13 @@ if (!getApps().length && creds) {
   } catch (e) { console.error('[firebase-admin] initializeApp FAILED:', e.message); }
 }
 
+/* ───────── app & middlewares ───────── */
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── diag endpoints ───────────────────────────────────────────
+/* ───────── diagnostics ───────── */
 app.get('/_diag', (_req, res) => {
   res.json({
     ok: true,
@@ -90,6 +92,8 @@ app.get('/_diag', (_req, res) => {
   });
 });
 
+// какой бот у текущего токена
+const BOT_TOKEN = (TG_BOT_TOKEN || '').trim();
 app.get('/whoami', async (_req, res) => {
   try {
     if (!BOT_TOKEN) return res.status(500).json({ ok: false, error: 'TG_BOT_TOKEN not set' });
@@ -101,23 +105,31 @@ app.get('/whoami', async (_req, res) => {
   }
 });
 
-// Для ручной проверки подписи: /_debug-sig?<параметры от TG>
+/* ───────── Telegram verify ───────── */
 const TL_ALLOWED_KEYS = new Set([
   'id', 'first_name', 'last_name', 'username', 'photo_url', 'auth_date', 'allow_write_to_pm',
 ]);
-const BOT_TOKEN = (TG_BOT_TOKEN || '').trim();
 const tokenSecret = () => crypto.createHash('sha256').update(BOT_TOKEN).digest();
 
+// строка подписи: только TG-ключи и только с НЕпустыми значениями
 function buildDataCheckString(queryObj) {
   const data = {};
   for (const k of Object.keys(queryObj)) {
     if (k === 'hash') continue;
-    if (TL_ALLOWED_KEYS.has(k) && queryObj[k] !== undefined) data[k] = String(queryObj[k]);
+    if (!TL_ALLOWED_KEYS.has(k)) continue;
+
+    const v = queryObj[k];
+    if (v === undefined || v === null) continue;
+    const s = String(v);
+    if (s === '') continue; // ВАЖНО: пустые значения НЕ включаем
+
+    data[k] = s;
   }
   const dataCheckString = Object.keys(data).sort().map((k) => `${k}=${data[k]}`).join('\n');
   return { data, dataCheckString };
 }
 
+// ручная проверка подписи
 app.get('/_debug-sig', (req, res) => {
   const { data, dataCheckString } = buildDataCheckString(req.query || {});
   const computed = crypto.createHmac('sha256', tokenSecret()).update(dataCheckString).digest('hex');
@@ -129,11 +141,11 @@ app.get('/_debug-sig', (req, res) => {
     computedHmac: computed,
     receivedHash: received || null,
     equal: !!received && computed === received,
-    note: 'Если equal=false — чаще всего TG_BOT_TOKEN не от того бота, что в data-telegram-login на фронте.',
+    note: 'Если equal=false — проверь TG_BOT_TOKEN и набор полей (пустые должны игнорироваться).',
   });
 });
 
-// ── алиасы старых путей на /tg/callback ───────────────────────
+// алиасы старых путей
 function redirectToCallback(req, res) {
   const qs = new URLSearchParams(req.query || {}).toString();
   res.redirect(302, '/tg/callback' + (qs ? `?${qs}` : ''));
@@ -142,7 +154,7 @@ app.get('/auth/telegram/verify', redirectToCallback);
 app.get('/auth/telegram/callback', redirectToCallback);
 app.get('/tg/verify', redirectToCallback);
 
-// ── основная верификация ──────────────────────────────────────
+// основная верификация
 function verifyTelegramAuth(queryObj) {
   const { dataCheckString } = buildDataCheckString(queryObj);
   const calc = crypto.createHmac('sha256', tokenSecret()).update(dataCheckString).digest('hex');
@@ -151,22 +163,21 @@ function verifyTelegramAuth(queryObj) {
     console.warn('[verify] BAD HASH\n  data_check_string:', dataCheckString, '\n  computed:', calc, '\n  received:', queryObj.hash);
     return { ok: false, reason: 'bad-hash' };
   }
+  // свежесть (24 часа)
   const now = Math.floor(Date.now() / 1000);
   const ts = Number(queryObj.auth_date || 0);
   if (!ts || now - ts > 60 * 60 * 24) return { ok: false, reason: 'stale' };
   return { ok: true };
 }
 
-// ── основной callback ─────────────────────────────────────────
+/* ───────── основной callback ───────── */
 app.get('/tg/callback', async (req, res) => {
   try {
     if (!TG_BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
     if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
 
-    // TEMP: байпас (только для теста)
-    if (DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1') {
-      console.warn('[verify] BYPASSED by DEBUG_ALLOW_BYPASS');
-    } else {
+    // Временный байпас (для теста): DEBUG_ALLOW_BYPASS=1 + &skipVerify=1
+    if (!(DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1')) {
       const v = verifyTelegramAuth(req.query);
       if (!v.ok) return res.status(403).send(v.reason === 'stale' ? 'Auth expired' : 'Invalid Telegram hash');
     }
@@ -174,13 +185,17 @@ app.get('/tg/callback', async (req, res) => {
     const { id, first_name, last_name, username, phone = '' } = req.query;
     const uid = `tg_${id}`;
     const name = [first_name, last_name].filter(Boolean).join(' ');
-    const claims = { tgId: String(id), username: username || '', phone: phone || '', name, authProvider: 'telegram' };
 
+    const claims = { tgId: String(id), username: username || '', phone: phone || '', name, authProvider: 'telegram' };
     const customToken = await getAuth().createCustomToken(uid, claims);
+
     const deeplink =
       `${APP_DEEPLINK}?token=${encodeURIComponent(customToken)}` +
       `&phone=${encodeURIComponent(phone || '')}` +
       `&name=${encodeURIComponent(name)}`;
+
+    // для отладки можно вернуть JSON вместо редиректа: &debug=1
+    if (req.query.debug === '1') return res.json({ ok: true, deeplink, note: 'обычно тут 302 на deeplink' });
 
     res.redirect(deeplink);
   } catch (e) {
