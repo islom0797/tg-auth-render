@@ -3,7 +3,7 @@
 // + 3 режима возврата:
 //   (A) Android Chrome: 302 на intent:// (авто-возврат)
 //   (B) Веб/Telegram WebView: авто-HTML каскад (zerno:// / intent:// / https)
-//   (C) Встроенный WebView в приложении: /tg/callback-embed → postMessage в RN
+//   (C) Встроенный WebView (RN): /tg/callback-embed → postMessage в RN
 
 import express from 'express';
 import crypto from 'crypto';
@@ -16,7 +16,7 @@ import { getStorage } from 'firebase-admin/storage';
 const {
   TG_BOT_TOKEN,
   APP_DEEPLINK = 'zerno://tg-auth',
-  APP_LINK_HTTPS = '', // опц. https deeplink, если настроены App/Universal Links
+  APP_LINK_HTTPS = '', // опц. Universal/App Link
 
   FIREBASE_SERVICE_ACCOUNT_JSON,
   FIREBASE_SERVICE_ACCOUNT_B64,
@@ -260,7 +260,7 @@ async function upsertAndToken(req, res) {
   return { customToken, phoneE164, phoneNoPlus, username, photo_url, name };
 }
 
-/* обычный браузерный callback (ожидает возврат в приложение) */
+/* обычный браузерный callback (возврат в приложение) */
 app.get('/tg/callback', async (req, res) => {
   try {
     if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
@@ -296,7 +296,7 @@ app.get('/tg/callback', async (req, res) => {
   }
 });
 
-/* НОВОЕ: callback для ВСТРОЕННОГО WebView в приложении — отдаёт postMessage */
+/* callback для ВСТРОЕННОГО WebView (RN) — отдаёт postMessage и сам закрывается */
 app.get('/tg/callback-embed', async (req, res) => {
   try {
     if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
@@ -327,10 +327,16 @@ app.get('/tg/callback-embed', async (req, res) => {
       ts: Date.now()
     };
     try {
-      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+        window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+      }
     } catch(e) {}
-    // как fallback — покажем кнопку "Вернуться"
-    document.write('<div style="padding:20px;text-align:center"><div style="font-weight:700;margin-bottom:8px">Готово</div><div style="opacity:.8">Можно закрыть окно и вернуться в приложение.</div></div>');
+
+    // попробуем закрыть вкладку; если нельзя — уходим на about:blank
+    setTimeout(function(){
+      try { window.close(); } catch(e) {}
+      try { location.replace('about:blank'); } catch(e) {}
+    }, 50);
   })();
 </script>
 </body></html>`);
