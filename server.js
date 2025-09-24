@@ -1,6 +1,7 @@
-// server.js — Telegram Login → Firebase Custom Token + умный upsert профиля по номеру
-// + обновление фото из Telegram и удаление старой фотки из Firebase Storage (если она там)
-// + авто-возврат в приложение (Android: intent://, iOS/прочее: авто-HTML редирект)
+// Telegram Login → Firebase Custom Token + умный upsert профиля по номеру
+// + удаление старой фотки из Firebase Storage (если была)
+// + авто-возврат в приложение (Android: intent://, iOS/прочее: авто-HTML)
+
 import express from 'express';
 import crypto from 'crypto';
 import cors from 'cors';
@@ -20,14 +21,11 @@ const {
   FIREBASE_PRIVATE_KEY,
   FIREBASE_STORAGE_BUCKET,
 
-  // для intent:// (Android)
   ANDROID_PACKAGE = 'com.zernoapp',
-
-  // для локальной отладки можно обойти verify: DEBUG_ALLOW_BYPASS=1 + &skipVerify=1
   DEBUG_ALLOW_BYPASS = '0',
 } = process.env;
 
-/* ───────── helpers (маски в логах) ───────── */
+/* ── helpers ─────────────────────────────────────────────── */
 const maskEmail = (email = '') => {
   const [u, d] = String(email).split('@');
   if (!d) return '***';
@@ -59,8 +57,11 @@ function loadFirebaseCredentials() {
 }
 
 const creds = loadFirebaseCredentials();
+let defaultBucketName = FIREBASE_STORAGE_BUCKET || (creds?.projectId ? `${creds.projectId}.appspot.com` : undefined);
 
 console.log('[env] TG_BOT_TOKEN:', TG_BOT_TOKEN ? 'SET' : 'MISSING');
+console.log('[env] DEBUG_ALLOW_BYPASS:', DEBUG_ALLOW_BYPASS);
+console.log('[env] ANDROID_PACKAGE:', ANDROID_PACKAGE);
 if (creds) {
   console.log('[env] Firebase creds method:', creds.method);
   console.log('[env] projectId:', creds.projectId);
@@ -69,12 +70,8 @@ if (creds) {
 } else {
   console.error('[env] Firebase creds: NOT FOUND');
 }
-console.log('[env] DEBUG_ALLOW_BYPASS:', DEBUG_ALLOW_BYPASS);
-console.log('[env] ANDROID_PACKAGE:', ANDROID_PACKAGE);
 
-/* ───────── init firebase-admin ───────── */
-let defaultBucketName = FIREBASE_STORAGE_BUCKET || (creds?.projectId ? `${creds.projectId}.appspot.com` : undefined);
-
+/* ── init firebase-admin ─────────────────────────────────── */
 if (!getApps().length && creds) {
   try {
     initializeApp({
@@ -89,13 +86,13 @@ if (!getApps().length && creds) {
   } catch (e) { console.error('[firebase-admin] initializeApp FAILED:', e.message); }
 }
 
-/* ───────── app ───────── */
+/* ── app ─────────────────────────────────────────────────── */
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* ───────── diagnostics ───────── */
+/* diagnostics */
 app.get('/_diag', (_req, res) => {
   res.json({
     ok: true,
@@ -112,15 +109,8 @@ app.get('/_diag', (_req, res) => {
 });
 
 const BOT_TOKEN = (TG_BOT_TOKEN || '').trim();
-app.get('/whoami', async (_req, res) => {
-  try {
-    if (!BOT_TOKEN) return res.status(500).json({ ok:false, error:'TG_BOT_TOKEN not set' });
-    const r = await fetch(`https://api.telegram.org/bot${encodeURIComponent(BOT_TOKEN)}/getMe`);
-    res.json(await r.json());
-  } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
-});
 
-/* ───────── Telegram verify ───────── */
+/* Telegram verify */
 const TL_ALLOWED_KEYS = new Set(['id','first_name','last_name','username','photo_url','auth_date','allow_write_to_pm']);
 const tokenSecret = () => crypto.createHash('sha256').update(BOT_TOKEN).digest();
 
@@ -138,23 +128,6 @@ function buildDataCheckString(q) {
   const dataCheckString = Object.keys(data).sort().map(k => `${k}=${data[k]}`).join('\n');
   return { data, dataCheckString };
 }
-
-app.get('/_debug-sig', (req, res) => {
-  const { data, dataCheckString } = buildDataCheckString(req.query || {});
-  const computed = crypto.createHmac('sha256', tokenSecret()).update(dataCheckString).digest('hex');
-  const received = String(req.query?.hash || '').toLowerCase();
-  res.json({ ok:true, usedKeys:Object.keys(data), dataCheckString, computedHmac:computed, receivedHash:received || null, equal: !!received && computed===received });
-});
-
-// алиасы старых путей
-function redirectToCallback(req, res) {
-  const qs = new URLSearchParams(req.query || {}).toString();
-  res.redirect(302, '/tg/callback' + (qs ? `?${qs}` : ''));
-}
-app.get('/auth/telegram/verify', redirectToCallback);
-app.get('/auth/telegram/callback', redirectToCallback);
-app.get('/tg/verify', redirectToCallback);
-
 function verifyTelegramAuth(q) {
   const { dataCheckString } = buildDataCheckString(q);
   const calc = crypto.createHmac('sha256', tokenSecret()).update(dataCheckString).digest('hex');
@@ -166,7 +139,7 @@ function verifyTelegramAuth(q) {
   return { ok:true };
 }
 
-/* ───────── helpers: удаление старой фотки из Storage ───────── */
+/* storage helper */
 function parseGsFileFromUrl(url = '', bucketName) {
   if (!url) return null;
   try {
@@ -189,7 +162,6 @@ function parseGsFileFromUrl(url = '', bucketName) {
   } catch {}
   return null;
 }
-
 async function deleteOldPhotoIfInStorage(oldUrl) {
   try {
     if (!oldUrl) return;
@@ -197,15 +169,23 @@ async function deleteOldPhotoIfInStorage(oldUrl) {
     if (!bucketName) return;
     const relPath = parseGsFileFromUrl(oldUrl, bucketName);
     if (!relPath) return;
-    const bucket = getStorage().bucket(bucketName);
-    await bucket.file(relPath).delete({ ignoreNotFound: true });
+    await getStorage().bucket(bucketName).file(relPath).delete({ ignoreNotFound: true });
     console.log('[storage] deleted old photo:', relPath);
   } catch (e) {
     console.warn('[storage] delete old photo failed:', e?.message || e);
   }
 }
 
-/* ───────── основной callback ───────── */
+/* алиасы старых путей */
+function redirectToCallback(req, res) {
+  const qs = new URLSearchParams(req.query || {}).toString();
+  res.redirect(302, '/tg/callback' + (qs ? `?${qs}` : ''));
+}
+app.get('/auth/telegram/verify', redirectToCallback);
+app.get('/auth/telegram/callback', redirectToCallback);
+app.get('/tg/verify', redirectToCallback);
+
+/* основной callback */
 app.get('/tg/callback', async (req, res) => {
   try {
     if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
@@ -240,26 +220,25 @@ app.get('/tg/callback', async (req, res) => {
         if (photo_url && old.photoURL && photo_url !== old.photoURL) {
           await deleteOldPhotoIfInStorage(old.photoURL);
         }
-        const delta = {
+        await ref.set({
           firstName: old.firstName ?? (first_name || null),
           lastName : old.lastName  ?? (last_name  || null),
-          fullName : old.fullName  ?? (name       || null),
-          username : old.username  ?? (username   || null),
+          fullName : old.fullName  ?? (name || null),
+          username : old.username  ?? (username || null),
           photoURL : photo_url || old.photoURL || null,
           provider : old.provider || 'telegram',
           lastLoginAt: Date.now(),
           createdAt: old.createdAt || Date.now(),
           telegramId: String(id),
-        };
-        await ref.set(delta, { merge: true });
+        }, { merge: true });
       } else {
         await ref.set({
           phone: phoneE164,
           firstName: first_name || null,
-          lastName: last_name || null,
-          fullName: name || null,
-          username: username || null,
-          photoURL: photo_url || null,
+          lastName:  last_name  || null,
+          fullName:  name       || null,
+          username:  username   || null,
+          photoURL:  photo_url  || null,
           email: null,
           provider: 'telegram',
           googleId: null,
@@ -278,75 +257,29 @@ app.get('/tg/callback', async (req, res) => {
     const claims = { tgId: String(id), username: username || '', phone: phoneE164, name, authProvider: 'telegram' };
     const customToken = await getAuth().createCustomToken(uid, claims);
 
-    // диплинк
-    const baseDeeplink =
-      `${APP_DEEPLINK}?token=${encodeURIComponent(customToken)}` +
-      `&phone=${encodeURIComponent(phoneE164)}` +
-      `&name=${encodeURIComponent(name || '')}` +
-      `&username=${encodeURIComponent(username || '')}` +
-      `&photo=${encodeURIComponent(photo_url || '')}`;
+    // диплинк: ВАЖНО — phone в ссылке БЕЗ '+', чтобы в RN не получился '++998…'
+    const phoneNoPlus = phoneE164.replace(/^\+/, '');
+    const queryPart = `token=${encodeURIComponent(customToken)}&phone=${encodeURIComponent(phoneNoPlus)}`;
+    const intentUrl = `intent://tg-auth?${queryPart}#Intent;scheme=zerno;package=${ANDROID_PACKAGE};end`;
+    const deeplink  = `${APP_DEEPLINK}?${queryPart}`;
 
     const ua = String(req.headers['user-agent'] || '');
-    let finalHref = baseDeeplnkForAgent(ua, baseDeeplink, ANDROID_PACKAGE);
-
-    if (req.query.debug === '1') {
-      return res.json({ ok: true, deeplink: baseDeeplink, finalHref, userAgent: ua });
-    }
-
-    // На Android Chrome используем 302 на intent://
     if (/Android/i.test(ua) && /Chrome/i.test(ua)) {
-      return res.redirect(finalHref);
+      return res.redirect(intentUrl);
     }
 
-    // Для iOS/Safari и прочих — авто-HTML, без лишних кликов
+    // iOS/прочее — авто-HTML
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.end(renderAutoOpenHtml(baseDeeplink));
+    return res.end(`<!doctype html>
+<meta http-equiv="refresh" content="0;url=${deeplink}">
+<a href="${deeplink}" style="font-family:sans-serif">Open ZernoApp</a>`);
   } catch (e) {
     console.error('tg/callback error:', e);
     return res.status(500).send('Server error');
   }
 });
 
-// формируем intent:// для Android Chrome
-function baseDeeplnkForAgent(ua, baseDeeplink, pkg) {
-  if (/Android/i.test(ua) && /Chrome/i.test(ua)) {
-    const queryPart = baseDeeplink.split('?')[1] || '';
-    // intent://tg-auth?token=...#Intent;scheme=zerno;package=com.zernoapp;end
-    return `intent://tg-auth?${queryPart}#Intent;scheme=zerno;package=${pkg};end`;
-  }
-  return baseDeeplink;
-}
-
-// HTML-страница, которая мгновенно открывает zerno:// и даёт fallback
-function renderAutoOpenHtml(deeplink) {
-  // небольшой таймаут нужен для корректной отработки некоторых браузеров
-  return `<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Открываем ZernoApp…</title>
-  <meta http-equiv="refresh" content="0;url=${deeplink}">
-  <style>
-    body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0c10;color:#fff}
-    .card{padding:20px 24px;border-radius:16px;background:#151923;box-shadow:0 8px 30px rgba(0,0,0,.35);text-align:center;max-width:420px}
-    .h1{font-weight:700;font-size:18px;margin:0 0 10px}
-    .muted{opacity:.75;font-size:14px;margin:6px 0}
-    a.btn{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:12px;background:#ffbf67;color:#23242A;text-decoration:none;font-weight:700}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="h1">Открываем приложение…</div>
-    <div class="muted">Если не открылось автоматически, нажмите:</div>
-    <a class="btn" href="${deeplink}">Открыть ZernoApp</a>
-  </div>
-  <script>setTimeout(function(){location.replace(${JSON.stringify(deeplink)});},0);</script>
-</body>
-</html>`;
-}
-
-// healthcheck
+/* healthcheck */
 app.get('/', (_req, res) => res.send('OK'));
 
 const port = process.env.PORT || 3000;
