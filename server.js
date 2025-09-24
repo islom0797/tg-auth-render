@@ -3,7 +3,7 @@
 // + 3 режима возврата:
 //   (A) Android Chrome: 302 на intent:// (авто-возврат)
 //   (B) Веб/Telegram WebView: авто-HTML каскад (zerno:// / intent:// / https)
-//   (C) Встроенный WebView (RN): /tg/callback-embed → postMessage в RN
+//   (C) Встроенный WebView (RN): /tg/callback-embed → postMessage + hash(#token=...)
 
 import express from 'express';
 import crypto from 'crypto';
@@ -16,7 +16,7 @@ import { getStorage } from 'firebase-admin/storage';
 const {
   TG_BOT_TOKEN,
   APP_DEEPLINK = 'zerno://tg-auth',
-  APP_LINK_HTTPS = '', // опц. Universal/App Link
+  APP_LINK_HTTPS = '', // опционально: Universal/App Link
 
   FIREBASE_SERVICE_ACCOUNT_JSON,
   FIREBASE_SERVICE_ACCOUNT_B64,
@@ -263,7 +263,7 @@ async function upsertAndToken(req, res) {
 /* обычный браузерный callback (возврат в приложение) */
 app.get('/tg/callback', async (req, res) => {
   try {
-    if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
+    if (!TG_BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
     if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
     if (!(DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1')) {
       const v = verifyTelegramAuth(req.query);
@@ -296,10 +296,10 @@ app.get('/tg/callback', async (req, res) => {
   }
 });
 
-/* callback для ВСТРОЕННОГО WebView (RN) — отдаёт postMessage и сам закрывается */
+/* ВСТРОЕННЫЙ WebView (RN): postMessage + hash(#token=...) как резерв */
 app.get('/tg/callback-embed', async (req, res) => {
   try {
-    if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
+    if (!TG_BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
     if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
     if (!(DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1')) {
       const v = verifyTelegramAuth(req.query);
@@ -308,7 +308,6 @@ app.get('/tg/callback-embed', async (req, res) => {
 
     const { customToken, phoneE164, phoneNoPlus, username, photo_url, name } = await upsertAndToken(req, res);
 
-    // RN WebView ловит это через onMessage
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.end(`<!doctype html>
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
@@ -326,17 +325,31 @@ app.get('/tg/callback-embed', async (req, res) => {
       name: ${JSON.stringify(name || '')},
       ts: Date.now()
     };
+
+    // 1) резерв в URL-хэш: #token=...&phone=...
     try {
-      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
-        window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+      var hash = '#token=' + encodeURIComponent(payload.token)
+               + '&phone=' + encodeURIComponent(payload.phone)
+               + '&phoneE164=' + encodeURIComponent(payload.phoneE164)
+               + '&username=' + encodeURIComponent(payload.username || '')
+               + '&name=' + encodeURIComponent(payload.name || '')
+               + '&photo=' + encodeURIComponent(payload.photo || '');
+      if (location.hash !== hash) {
+        history.replaceState(null, '', location.pathname + hash);
       }
+    } catch(e){}
+
+    // 2) основной путь — отправка в RN WebView
+    try {
+      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(payload));
     } catch(e) {}
 
-    // попробуем закрыть вкладку; если нельзя — уходим на about:blank
-    setTimeout(function(){
-      try { window.close(); } catch(e) {}
-      try { location.replace('about:blank'); } catch(e) {}
-    }, 50);
+    // 3) Fallback UI — если модалка вдруг не закрылась
+    document.write('<div style="padding:24px;text-align:center">'
+      + '<div style="font-weight:700;margin-bottom:8px">Готово ✅</div>'
+      + '<div style="opacity:.8;margin-bottom:12px">Можно закрыть окно и вернуться в приложение.</div>'
+      + '<button onclick="window.close()" style="padding:10px 14px;border-radius:10px;background:#ffbf67;color:#23242A;font-weight:700;border:0">Вернуться</button>'
+      + '</div>');
   })();
 </script>
 </body></html>`);
