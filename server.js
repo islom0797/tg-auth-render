@@ -1,6 +1,9 @@
-// server.js — Telegram Login → Firebase Custom Token + upsert профиля по номеру
-// + авто-возврат в приложение (Android: intent://, iOS/прочее/Telegram WebView: агрессивный авто-HTML с каскадом попыток)
-// + обновление фото из Telegram и удаление старой фотки из Firebase Storage (если она там)
+// server.js — Telegram Login → Firebase Custom Token + upsert по номеру
+// + удаление старой фотки из Storage (если была)
+// + 3 режима возврата:
+//   (A) Android Chrome: 302 на intent:// (авто-возврат)
+//   (B) Веб/Telegram WebView: авто-HTML каскад (zerno:// / intent:// / https)
+//   (C) Встроенный WebView в приложении: /tg/callback-embed → postMessage в RN
 
 import express from 'express';
 import crypto from 'crypto';
@@ -12,19 +15,21 @@ import { getStorage } from 'firebase-admin/storage';
 
 const {
   TG_BOT_TOKEN,
-  APP_DEEPLINK = 'zerno://tg-auth',    // кастомная схема, например zerno://tg-auth
-  APP_LINK_HTTPS = '',                  // опционально: https://link.zerno.uz/tg-auth (App Links/Universal Links)
+  APP_DEEPLINK = 'zerno://tg-auth',
+  APP_LINK_HTTPS = '', // опц. https deeplink, если настроены App/Universal Links
+
   FIREBASE_SERVICE_ACCOUNT_JSON,
   FIREBASE_SERVICE_ACCOUNT_B64,
   FIREBASE_PROJECT_ID,
   FIREBASE_CLIENT_EMAIL,
   FIREBASE_PRIVATE_KEY,
   FIREBASE_STORAGE_BUCKET,
+
   ANDROID_PACKAGE = 'com.zernoapp',
   DEBUG_ALLOW_BYPASS = '0',
 } = process.env;
 
-/* ─ helpers ─ */
+/* helpers */
 const maskEmail = (email = '') => {
   const [u, d] = String(email).split('@');
   if (!d) return '***';
@@ -72,7 +77,7 @@ if (creds) {
   console.error('[env] Firebase creds: NOT FOUND');
 }
 
-/* ─ init firebase-admin ─ */
+/* init firebase-admin */
 if (!getApps().length && creds) {
   try {
     initializeApp({
@@ -83,17 +88,17 @@ if (!getApps().length && creds) {
       }),
       storageBucket: defaultBucketName,
     });
-    console.log('[firebase-admin] initializeApp: OK; bucket =', defaultBucketName || '(default)');
+    console.log('[firebase-admin] initializeApp OK; bucket =', defaultBucketName || '(default)');
   } catch (e) { console.error('[firebase-admin] initializeApp FAILED:', e.message); }
 }
 
-/* ─ app ─ */
+/* app */
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* diag */
+/* diagnostics */
 app.get('/_diag', (_req, res) => {
   res.json({
     ok: true,
@@ -146,7 +151,7 @@ app.get('/_debug-sig', (req, res) => {
   res.json({ ok:true, usedKeys:Object.keys(data), dataCheckString, computedHmac:computed, receivedHash:received || null, equal: !!received && computed===received });
 });
 
-/* алиасы */
+/* aliases */
 function redirectToCallback(req, res) {
   const qs = new URLSearchParams(req.query || {}).toString();
   res.redirect(302, '/tg/callback' + (qs ? `?${qs}` : ''));
@@ -190,160 +195,152 @@ async function deleteOldPhotoIfInStorage(oldUrl) {
   } catch (e) { console.warn('[storage] delete old photo failed:', e?.message || e); }
 }
 
-/* основной callback */
+/* общий обработчик upsert + token */
+async function upsertAndToken(req, res) {
+  const {
+    id,
+    first_name = '',
+    last_name = '',
+    username = '',
+    photo_url = '',
+    phone = '', // 998XXXXXXXXX
+  } = req.query;
+
+  const phoneE164 = phone ? (phone.startsWith('+') ? phone : `+${phone}`) : '';
+  if (!phoneE164) throw new Error('Phone is required');
+
+  try {
+    const db = getFirestore();
+    const ref = db.doc(`users/${phoneE164}`);
+    const snap = await ref.get();
+    const name = [first_name, last_name].filter(Boolean).join(' ') || first_name || null;
+
+    if (snap.exists) {
+      const old = snap.data() || {};
+      if (photo_url && old.photoURL && photo_url !== old.photoURL) {
+        await deleteOldPhotoIfInStorage(old.photoURL);
+      }
+      await ref.set({
+        firstName: old.firstName ?? (first_name || null),
+        lastName : old.lastName  ?? (last_name  || null),
+        fullName : old.fullName  ?? (name || null),
+        username : old.username  ?? (username || null),
+        photoURL : photo_url || old.photoURL || null,
+        provider : old.provider || 'telegram',
+        lastLoginAt: Date.now(),
+        createdAt: old.createdAt || Date.now(),
+        telegramId: String(id),
+      }, { merge: true });
+    } else {
+      await ref.set({
+        phone: phoneE164,
+        firstName: first_name || null,
+        lastName:  last_name  || null,
+        fullName:  name       || null,
+        username:  username   || null,
+        photoURL:  photo_url  || null,
+        email: null,
+        provider: 'telegram',
+        googleId: null,
+        createdAt: Date.now(),
+        lastLoginAt: Date.now(),
+        telegramId: String(id),
+      }, { merge: true });
+    }
+  } catch (e) {
+    console.error('firestore upsert error:', e?.message || e);
+  }
+
+  const uid = `tg_${id}`;
+  const name = [req.query.first_name, req.query.last_name].filter(Boolean).join(' ');
+  const claims = { tgId: String(id), username: username || '', phone: phoneE164, name, authProvider: 'telegram' };
+  const customToken = await getAuth().createCustomToken(uid, claims);
+
+  const phoneNoPlus = phoneE164.replace(/^\+/, '');
+  return { customToken, phoneE164, phoneNoPlus, username, photo_url, name };
+}
+
+/* обычный браузерный callback (ожидает возврат в приложение) */
 app.get('/tg/callback', async (req, res) => {
   try {
     if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
     if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
-
     if (!(DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1')) {
       const v = verifyTelegramAuth(req.query);
       if (!v.ok) return res.status(403).send(v.reason === 'stale' ? 'Auth expired' : 'Invalid Telegram hash');
     }
 
-    const {
-      id,
-      first_name = '',
-      last_name = '',
-      username = '',
-      photo_url = '',
-      phone = '', // ожидаем 998XXXXXXXXX (без '+')
-    } = req.query;
-
-    const phoneE164 = phone ? (phone.startsWith('+') ? phone : `+${phone}`) : '';
-    if (!phoneE164) return res.status(400).send('Phone is required');
-
-    // upsert профиля
-    try {
-      const db = getFirestore();
-      const ref = db.doc(`users/${phoneE164}`);
-      const snap = await ref.get();
-      const name = [first_name, last_name].filter(Boolean).join(' ') || first_name || null;
-
-      if (snap.exists) {
-        const old = snap.data() || {};
-        if (photo_url && old.photoURL && photo_url !== old.photoURL) {
-          await deleteOldPhotoIfInStorage(old.photoURL);
-        }
-        await ref.set({
-          firstName: old.firstName ?? (first_name || null),
-          lastName : old.lastName  ?? (last_name  || null),
-          fullName : old.fullName  ?? (name || null),
-          username : old.username  ?? (username || null),
-          photoURL : photo_url || old.photoURL || null,
-          provider : old.provider || 'telegram',
-          lastLoginAt: Date.now(),
-          createdAt: old.createdAt || Date.now(),
-          telegramId: String(id),
-        }, { merge: true });
-      } else {
-        await ref.set({
-          phone: phoneE164,
-          firstName: first_name || null,
-          lastName:  last_name  || null,
-          fullName:  name       || null,
-          username:  username   || null,
-          photoURL:  photo_url  || null,
-          email: null,
-          provider: 'telegram',
-          googleId: null,
-          createdAt: Date.now(),
-          lastLoginAt: Date.now(),
-          telegramId: String(id),
-        }, { merge: true });
-      }
-    } catch (e) {
-      console.error('firestore upsert error:', e?.message || e);
-    }
-
-    // кастом-токен
-    const uid = `tg_${id}`;
-    const name = [req.query.first_name, req.query.last_name].filter(Boolean).join(' ');
-    const claims = { tgId: String(id), username: username || '', phone: phoneE164, name, authProvider: 'telegram' };
-    const customToken = await getAuth().createCustomToken(uid, claims);
-
-    // диплинки (phone в ссылке — без '+')
-    const phoneNoPlus = phoneE164.replace(/^\+/, '');
-    const queryPart   = `token=${encodeURIComponent(customToken)}&phone=${encodeURIComponent(phoneNoPlus)}`;
-    const intentUrl   = `intent://tg-auth?${queryPart}#Intent;scheme=zerno;package=${ANDROID_PACKAGE};end`;
-    const deeplink    = `${APP_DEEPLINK}?${queryPart}`;
-    const httpsLink   = APP_LINK_HTTPS ? `${APP_LINK_HTTPS}?${queryPart}` : '';
+    const { customToken, phoneNoPlus } = await upsertAndToken(req, res);
 
     const ua = String(req.headers['user-agent'] || '');
     const isAndroid  = /Android/i.test(ua);
     const isChrome   = /Chrome/i.test(ua);
     const isTelegram = /Telegram/i.test(ua);
 
-    // Android браузер вне Telegram → 302 на intent:// (максимально надёжно)
+    const queryPart = `token=${encodeURIComponent(customToken)}&phone=${encodeURIComponent(phoneNoPlus)}`;
+    const intentUrl = `intent://tg-auth?${queryPart}#Intent;scheme=zerno;package=${ANDROID_PACKAGE};end`;
+    const deeplink  = `${APP_DEEPLINK}?${queryPart}`;
+    const httpsLink = APP_LINK_HTTPS ? `${APP_LINK_HTTPS}?${queryPart}` : '';
+
     if (isAndroid && isChrome && !isTelegram) {
       return res.redirect(intentUrl);
     }
 
-    // Агрессивный авто-HTML: meta refresh + программный клик + iframe + несколько попыток
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.end(`<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Открываем ZernoApp…</title>
 <meta http-equiv="refresh" content="0;url=${isAndroid ? intentUrl : (httpsLink || deeplink)}">
-<style>
-  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0c10;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto}
-  .card{padding:20px 24px;border-radius:16px;background:#151923;box-shadow:0 8px 30px rgba(0,0,0,.35);text-align:center;max-width:420px}
-  .btn{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:12px;background:#ffbf67;color:#23242A;text-decoration:none;font-weight:700}
-  .muted{opacity:.75;font-size:14px;margin-top:6px}
-</style>
-</head>
-<body>
-  <div class="card">
-    <div style="font-weight:700;font-size:18px">Открываем приложение…</div>
-    <div class="muted">Если не открылось автоматически, нажмите кнопку:</div>
-    <a id="go" class="btn" href="${isAndroid ? intentUrl : (httpsLink || deeplink)}">Открыть ZernoApp</a>
-  </div>
-  <script>
-    (function(){
-      var isAndroid = ${JSON.stringify(isAndroid)};
-      var intent  = ${JSON.stringify(intentUrl)};
-      var custom  = ${JSON.stringify(deeplink)};
-      var https   = ${JSON.stringify(httpsLink)};
-      var href1   = isAndroid ? intent : (https || custom);
-
-      // 1) попытка через программный клик (часто проходит даже в WebView)
-      try {
-        var a = document.getElementById('go');
-        if (a && a.click) a.click();
-      } catch(e){}
-
-      // 2) смена location через replace (не оставляет историю)
-      setTimeout(function(){ try { location.replace(href1); } catch(e){} }, 150);
-
-      // 3) скрытый iframe (некоторые WebView разрешают)
-      setTimeout(function(){
-        try {
-          var iframe = document.createElement('iframe');
-          iframe.style.display = 'none';
-          iframe.src = href1;
-          document.body.appendChild(iframe);
-        } catch(e){}
-      }, 350);
-
-      // 4) ещё попытка через href (иногда only href срабатывает)
-      setTimeout(function(){ try { location.href = href1; } catch(e){} }, 700);
-
-      // 5) финальный откат на кастомную схему (иногда срабатывает со 2-й попытки)
-      setTimeout(function(){ try { location.href = custom; } catch(e){} }, 1200);
-    })();
-  </script>
-</body>
-</html>`);
+<a href="${isAndroid ? intentUrl : (httpsLink || deeplink)}">Open ZernoApp</a>`);
   } catch (e) {
     console.error('tg/callback error:', e);
     return res.status(500).send('Server error');
   }
 });
 
-/* healthcheck */
+/* НОВОЕ: callback для ВСТРОЕННОГО WebView в приложении — отдаёт postMessage */
+app.get('/tg/callback-embed', async (req, res) => {
+  try {
+    if (!BOT_TOKEN) return res.status(500).send('TG_BOT_TOKEN not configured');
+    if (!getApps().length) return res.status(500).send('Firebase Admin is not initialized. Check ENV credentials.');
+    if (!(DEBUG_ALLOW_BYPASS === '1' && String(req.query?.skipVerify) === '1')) {
+      const v = verifyTelegramAuth(req.query);
+      if (!v.ok) return res.status(403).send(v.reason === 'stale' ? 'Auth expired' : 'Invalid Telegram hash');
+    }
+
+    const { customToken, phoneE164, phoneNoPlus, username, photo_url, name } = await upsertAndToken(req, res);
+
+    // RN WebView ловит это через onMessage
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(`<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="background:#0b0c10;color:#fff;font-family:sans-serif">
+<script>
+  (function(){
+    var payload = {
+      ok: true,
+      type: 'tg-auth',
+      token: ${JSON.stringify(customToken)},
+      phoneE164: ${JSON.stringify(phoneE164)},
+      phone: ${JSON.stringify(phoneNoPlus)},
+      username: ${JSON.stringify(username || '')},
+      photo: ${JSON.stringify(photo_url || '')},
+      name: ${JSON.stringify(name || '')},
+      ts: Date.now()
+    };
+    try {
+      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+    } catch(e) {}
+    // как fallback — покажем кнопку "Вернуться"
+    document.write('<div style="padding:20px;text-align:center"><div style="font-weight:700;margin-bottom:8px">Готово</div><div style="opacity:.8">Можно закрыть окно и вернуться в приложение.</div></div>');
+  })();
+</script>
+</body></html>`);
+  } catch (e) {
+    console.error('tg/callback-embed error:', e);
+    return res.status(500).send('Server error');
+  }
+});
+
+/* health */
 app.get('/', (_req, res) => res.send('OK'));
 
 const port = process.env.PORT || 3000;
